@@ -7,5 +7,5 @@ data_cleaning: contains the data cleaning notebook (in python), and the finished
 
 data_analysis: containes the RMD notebook with the whole analysis.
 
-ChatGPT_prompts: contains prompts and responses
+ChatGPT_prompts: contains prompts and responses.
 
