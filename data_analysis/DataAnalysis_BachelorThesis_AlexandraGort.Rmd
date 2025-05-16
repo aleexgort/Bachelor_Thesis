@@ -1,0 +1,1696 @@
+---
+title: "DataAnalysis_BachelorThesis_R_Notebook"
+output: 
+  html_notebook:
+    toc: true
+    toc_depth: 3
+---
+
+\newpage
+
+```{r}
+print(sessionInfo())
+```
+
+```{r}
+
+install.packages(c("survey", "MatchIt", "dplyr", "ggplot2", "cobalt", "reshape2", "DataExplorer", "grf"))
+
+
+
+library(survey) 
+library(MatchIt)
+library(dplyr)
+library(ggplot2)
+library(cobalt)
+library(scales)
+library(reshape2)
+library(DataExplorer)
+library(tableone)
+library(grf)
+
+ 
+# Load the clean dataset that I created in Python
+data <- read.csv("/Users/alexandragort/Documents/BA/BA_df.csv")
+# Define the NHANES survey design 
+nhanes_design <- svydesign(
+  id = ~SDMVPSU,        # Primary Sampling Unit (PSU)
+  strata = ~SDMVSTRA, # Strata variable
+  weights = ~WTMEC8YR,# Survey weights
+  data = data,
+  nest = TRUE # As stated in the sample code of NHANES website
+)
+# Subsetting the data to exclude missing values to get df i can work with
+valid_rows <- apply(data, 1, function(row) all(row != -1))
+df <- subset(nhanes_design, valid_rows)
+
+
+## Source: National Center for Health Statistics. (n.d.). National Health and Nutrition Examination Survey: Sample code. Centers for Disease Control and Prevention. https://wwwn.cdc.gov/nchs/nhanes/tutorials/samplecode.aspx
+
+
+```
+
+# Exploratory Data Analysis:
+
+```{r}
+# Filter for only variables i want in the analyis
+analysisvars <- c("seqn", "HI_or_Not", "Private", "Medicare", "Medicaid", "Dental_Visits", "gender", "age", "income", "race", "citizenship", "SDMVPSU", "SDMVSTRA", "WTMEC8YR", "Dental_Dummy", "low_income"
+)
+df <- df[, analysisvars]
+```
+
+```{r}
+# Tables with variable overview
+
+#binary
+binaryvars <- c("HI_or_Not", "Private", "Medicare", "Medicaid", 
+                 "Dental_Dummy","citizenship", "gender", "low_income")
+
+for (var in binaryvars) {
+  cat("Counts for", var, ":\n")
+  
+  if (var %in% c("gender", "citizenship")) {
+    result <- svytotal(~factor(get(var), levels = c(1, 2)), df)
+  } else {
+    result <- svytotal(~factor(get(var), levels = c(0, 1)), df)
+  }
+  
+  print(result)
+  cat("\n")
+}
+
+```
+
+```{r}
+# Table with varibale overview
+
+# categorical with multiple levels
+categoricalvars <- c("income", "race")
+
+for (var in categoricalvars) {
+  cat("\nWeighted frequency table for", var, ":\n")
+  
+  formulaa <- as.formula(paste0("~", var))
+  
+  freqtable <- svytable(formulaa, df)
+  
+  freqdf <- as.data.frame(freqtable)
+  colnames(freqdf) <- c("Category", "Weighted_Count")
+  
+  print(freqdf)
+}
+
+```
+
+```{r}
+# Tables with variable overview
+
+# continuous
+agevar <- "age"
+
+formula <- as.formula(paste0("~", agevar))
+
+mean <- as.numeric(coef(svymean(formula, df, na.rm = TRUE)))
+
+sd <- sqrt(as.numeric(svyvar(formula, df, na.rm = TRUE)))
+
+quantiles <- svyquantile(formula, df, c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE, ci = FALSE)
+quant <- as.numeric(quantiles[[1]])
+
+# Summary data frame
+agesummarydf <- data.frame(
+  Variable = agevar,
+  Mean = mean,
+  SD = sd,
+  Min = quant[1],
+  Q1 = quant[2],
+  Median = quant[3],
+  Q3 = quant[4],
+  Max = quant[5]
+)
+
+print(agesummarydf)
+```
+
+```{r}
+# Visualization of income and race
+# Race data
+race_df <- data.frame(
+  Category = c("Mexican American", "Other Hispanic", "Non-Hispanic White", 
+               "Non-Hispanic Black", "Non-Hispanic Asian", "Other/Multiracial"),
+  Total = c(29181148, 18714483, 183885193, 34588247, 15200506, 11601652)
+)
+
+# Income data
+income_df <- data.frame(
+  Category = c("$0–$4,999", "$5,000–$9,999", "$10,000–$14,999", "$15,000–$19,999",
+               "$20,000–$24,999", "$25,000–$34,999", "$35,000–$44,999", 
+               "$45,000–$54,999", "$55,000–$64,999", "$65,000–$74,999"),
+  Total = c(5390654, 7651124, 12612416, 14462480, 16816367, 27706225, 
+            27758844, 22848502, 18348915, 16418422)
+)
+
+# Race plot
+ggplot(race_df, aes(x = reorder(Category, Total), y = Total)) +
+  geom_col(fill = "#4B6EAF") +
+  coord_flip() +
+  scale_y_continuous(labels = function(x) paste0(round(x / 1e6), " Mio")) +
+  labs(title = "Survey-Weighted Total by Race",
+       x = "Race",
+       y = "Total (Population Estimate)") +
+  theme_minimal()
+
+# Income plot
+ggplot(income_df, aes(x = reorder(Category, Total), y = Total)) +
+  geom_col(fill = "#4B6EAF") +
+  coord_flip() +
+  scale_y_continuous(labels = function(x) paste0(round(x / 1e6), " Mio")) +
+  labs(title = "Survey-Weighted Total by Income",
+       x = "Income Range",
+       y = "Total (Population Estimate)") +
+  theme_minimal()
+
+```
+
+```{r}
+# Correlations
+
+insurance_vars <- c("HI_or_Not", "Private", "Medicare", "Medicaid")
+covariates <- c("age", "gender", "citizenship", "race", "income")
+target <- "Dental_Dummy"
+
+# Create a data frame to store results since the corrrelations all have to be calculated manually because I want to take the survey design into account and therefore have to work within the limitations of the survey package and svyvar
+cor_results <- data.frame(
+  Var1 = character(),
+  Var2 = character(),
+  Correlation = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Using svyvar for the calculation
+compute_svy_cor <- function(var1, var2, design) {
+  cov_mat <- svyvar(as.formula(paste0("~", var1, " + ", var2)), design)
+  cov_val <- cov_mat[1, 2]
+  var1_var <- cov_mat[1, 1]
+  var2_var <- cov_mat[2, 2]
+  corr <- cov_val / sqrt(var1_var * var2_var)
+  return(corr)
+}
+
+# Looping through all the insurances and covariates
+for (ins in insurance_vars) {
+  for (covar in covariates) {
+    cor_val <- compute_svy_cor(ins, covar, nhanes_design)
+    cor_results <- rbind(cor_results, data.frame(Var1 = ins, Var2 = covar, Correlation = cor_val))
+  }
+}
+
+# Looping through all the insurances and the target variable
+for (ins in insurance_vars) {
+  cor_val <- compute_svy_cor(ins, target, nhanes_design)
+  cor_results <- rbind(cor_results, data.frame(Var1 = ins, Var2 = target, Correlation = cor_val))
+}
+
+# Looping through the dental dummy and all covariates
+for (covar in covariates) {
+  cor_val <- compute_svy_cor(target, covar, nhanes_design)
+  cor_results <- rbind(cor_results, data.frame(Var1 = target, Var2 = covar, Correlation = cor_val))
+}
+
+# View results
+print(cor_results)
+
+
+# Making a plot to visualize everything
+cor_results$Var1 <- gsub("_", " ", cor_results$Var1)
+cor_results$Var2 <- gsub("_", " ", cor_results$Var2)
+
+ggplot(cor_results, aes(x = Var2, y = Var1, fill = Correlation)) +
+  geom_tile(color = "white", linewidth = 0.6) +
+  scale_fill_gradient2(low = "#B22222", high = "#1E90FF", mid = "white",
+                       midpoint = 0, limit = c(-1, 1), space = "Lab",
+                       name = "Correlation") +
+  geom_text(aes(label = round(Correlation, 2)), color = "black", size = 3) +
+  labs(
+    title = "Survey-Weighted Correlations",
+    x = "Covariates and Target",
+    y = "Insurance Variables and Target"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  )
+
+# Code created with the help of ChatGPT see Appendix 3
+
+```
+
+# Data Analysis
+
+```{r}
+# Starting again with the clean df
+data <- read.csv("/Users/alexandragort/Documents/BA/BA_df.csv")
+
+valid_rows <- apply(data, 1, function(row) all(row != -1))
+data1 <- subset(data, valid_rows)
+
+
+```
+
+## HI_or_Not
+
+### PSM
+
+```{r}
+#PSM - the code for PSM was adapted according to the example from https://ehsanx.github.io/EpiMethods/propensityscore3.html and  https://cran.r-project.org/web/packages/MatchIt/vignettes/estimating-effects.html?utm_source=chatgpt.com#estimating-treatment-effects-and-standard-errors-after-matching
+
+# Convert binary/categorical variables appropriately
+data1$HI_or_Not <- as.factor(data1$HI_or_Not)
+data1$Dental_Dummy <- as.factor(data1$Dental_Dummy)
+data1$gender <- as.factor(data1$gender)
+data1$citizenship <- as.factor(data1$citizenship)
+data1$race <- factor(data1$race)
+data1$income <- factor(data1$income)
+data1$age <- as.numeric(as.character(data1$age))
+
+```
+
+```{r}
+
+set.seed(124)
+library(MatchIt)
+ps.formula <- HI_or_Not ~ age + gender + citizenship + race + income
+
+match.obj <- matchit(ps.formula, data = data1,
+                     method = "nearest",
+                     distance = "logit",
+                     replace = FALSE,
+                     caliper = 0.2,
+                     ratio = 1)
+
+# Add PS scores to the data
+data1$PS <- match.obj$distance
+matched.data1 <- match.data(match.obj)
+```
+
+```{r}
+library(survey)
+
+data1$matched <- 0 
+data1$matched[data1$seqn %in% matched.data1$seqn] <- 1  
+
+
+w.design0 <- svydesign(
+  strata = ~SDMVSTRA,       
+  id = ~SDMVPSU,             
+  weights = ~WTMEC8YR,  
+  data = data1, 
+  nest = TRUE
+)
+w.design.m <- subset(w.design0, matched == 1)
+#survey weighted logistic regression on matched data to get ATT
+out.formula <- Dental_Dummy ~ HI_or_Not
+sfit <- svyglm(out.formula, family = binomial, design = w.design.m)
+
+library(jtools)
+summ(sfit, exp = TRUE, confint = TRUE)
+
+```
+
+```{r}
+coef(sfit)  
+# Converting log-odds to odds ratio
+exp(coef(sfit)["HI_or_Not"]) 
+
+pred_probs_treated <- predict(sfit, newdata = subset(data1, HI_or_Not == 1), type = "response")
+pred_probs_untreated <- predict(sfit, newdata = subset(data1, HI_or_Not == 0), type = "response")
+att <- weighted.mean(pred_probs_treated, w = subset(data1, HI_or_Not == 1)$WTMEC8YR) - 
+       weighted.mean(pred_probs_untreated, w = subset(data1, HI_or_Not == 0)$WTMEC8YR)
+
+att
+```
+
+```{r}
+# Visualization
+library(ggplot2)
+
+ggplot(data1, aes(x = PS, color = as.factor(HI_or_Not))) +
+  geom_density() +
+  labs(title = "Density of PS (Before Matching) Insurance",
+       x = "Propensity Scores",
+       y = "Density") +
+  theme_minimal()
+
+# Plot Propensity Scores after matching
+ggplot(matched.data1, aes(x = PS, color = as.factor(HI_or_Not))) +
+  geom_density() +
+  labs(title = "Density of PS (After Matching) Insurance",
+       x = "Propensity Scores",
+       y = "Density") +
+  theme_minimal()
+
+
+```
+
+### GRF
+
+```{r}
+# in adaption to https://grf-labs.github.io/grf/articles/grf.html
+
+X <- model.matrix(~ race + citizenship + gender + income + age - 1, data = data1) #one-hot enocding otherwhise i get an error
+W <- as.numeric(data1$HI_or_Not) - 1
+Y <- as.numeric(data1$Dental_Dummy) - 1
+
+```
+
+```{r}
+cf <- causal_forest(X, Y, W)
+```
+
+```{r}
+treatment_effects <- predict(cf)$predictions # ITEs
+# GET ATET:
+treated_indices <- which(W == 1) # only on the treated
+treatment_effects_treated <- treatment_effects[treated_indices]
+weights_treated <- data1$WTMEC8YR[treated_indices]
+weighted_ATT <- sum(treatment_effects_treated * weights_treated) / sum(weights_treated)
+
+print(weighted_ATT)
+
+```
+
+```{r}
+#CATE for race
+races <- unique(data1$race)
+cate_by_race <- list()
+
+for (race_value in races) {
+  race_indices <- which(data1$race == race_value)
+  cate_race <- predict(cf)$predictions[race_indices]
+  weights_race <- data1$WTMEC8YR[race_indices]
+  weighted_cate_race <- sum(cate_race * weights_race) / sum(weights_race)
+  cate_by_race[[as.character(race_value)]] <- weighted_cate_race
+}
+
+#Adding labels
+racelabels <- c(
+  "1" = "Mexican American",
+  "2" = "Other Hispanic",
+  "3" = "White",
+  "4" = "Black",
+  "6" = "Asian",
+  "7" = "Other"
+)
+
+CATErace <- setNames(cate_by_race, racelabels[names(cate_by_race)])
+
+print(CATErace)
+
+#Visualization
+CATErace_df <- data.frame(
+  Race = names(CATErace),
+  CATE = unlist(CATErace)
+)
+
+color_palette <- c("#A6C8E5", "#4C82A4", "#5B9ECF", "#3A6A8D", "#1C3F57", "#BCC7D7")
+ggplot(CATErace_df, aes(x = Race, y = CATE, fill = Race)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  labs(
+    title = "CATE by Race",
+    x = "Race",
+    y = "CATE"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+#CATE for gender
+gender <- unique(data1$gender)
+cate_by_gender <- list()
+
+for (gender_value in gender) {
+  gender_indices <- which(data1$gender == gender_value)
+  cate_gender <- predict(cf)$predictions[gender_indices]
+  weights_gender <- data1$WTMEC8YR[gender_indices]
+  weighted_cate_gender <- sum(cate_gender * weights_gender) / sum(weights_gender)
+  cate_by_gender[[as.character(gender_value)]] <- weighted_cate_gender
+}
+
+#Adding labels
+genderlabels <- c(
+  "1" = "Male",
+  "2" = "Female"
+)
+
+CATEgender <- setNames(cate_by_gender, genderlabels[names(cate_by_gender)])
+
+print(CATEgender)
+
+#Visualization
+CATEgender_df <- data.frame(
+  Gender = names(CATEgender),
+  CATE = unlist(CATEgender)
+)
+
+color_palette <- c("#A6C8E5", "#4C82A4")
+ggplot(CATEgender_df, aes(x = Gender, y = CATE, fill = Gender)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  labs(
+    title = "CATE by Gender",
+    x = "Gender",
+    y = "CATE"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+```{r}
+#CATE for income
+income_groups <- unique(data1$income)
+cate_by_income <- list()
+
+for (income_value in income_groups) {
+  income_indices <- which(data1$income == income_value)
+  cate_income <- predict(cf)$predictions[income_indices]
+  weights_income <- data1$WTMEC8YR[income_indices]
+  weighted_cate_income <- sum(cate_income * weights_income) / sum(weights_income)
+  cate_by_income[[as.character(income_value)]] <- weighted_cate_income
+}
+
+# Visualization Preparation
+CATEincome_df <- data.frame(
+  Income = names(cate_by_income),
+  CATE = unlist(cate_by_income)
+)
+
+# Adding labels
+income_labels <- c(
+  "1" = "$0 to $4,999",
+  "2" = "$5,000 to $9,999",
+  "3" = "$10,000 to $14,999",
+  "4" = "$15,000 to $19,999",
+  "5" = "$20,000 to $24,999",
+  "6" = "$25,000 to $34,999",
+  "7" = "$35,000 to $44,999",
+  "8" = "$45,000 to $54,999",
+  "9" = "$55,000 to $64,999",
+  "10" = "$65,000 to $74,999",
+  "12" = "$20,000 and Over",
+  "13" = "Under $20,000",
+  "14" = "$75,000 to $99,999",
+  "15" = "$100,000 and Over"
+)
+
+#Visualization
+CATEincome_df$Income <- factor(CATEincome_df$Income, 
+                                levels = names(income_labels), 
+                                labels = income_labels[names(income_labels)])
+
+CATEincome_df$Income <- factor(CATEincome_df$Income, 
+                                levels = CATEincome_df$Income[order(CATEincome_df$CATE, decreasing = TRUE)])
+
+color_palette <- c(
+  "#A6C8E5", "#4C82A4", "#5B9ECF", "#3A6A8D", "#1C3F57", "#BCC7D7", "#C4D0D6", "#9EA6B7", "#7C8594", "#4A5B71", "#2E3F52", "#1C2839", "#7E92A0", "#B0C4D8", "#6D7D8C" 
+)
+
+
+ggplot(CATEincome_df, aes(x = Income, y = CATE, fill = Income)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  labs(
+    title = "CATE by Income",
+    x = "Income",
+    y = "CATE"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"  
+  )
+```
+
+```{r}
+#CATE for citizenship
+citizenship <- unique(data1$citizenship)
+cate_by_citizenship <- list()
+
+for (citizen_value in citizenship) {
+  citizen_indices <- which(data1$citizenship == citizen_value)
+  cate_citizen <- predict(cf)$predictions[citizen_indices]
+  weights_citizen <- data1$WTMEC8YR[citizen_indices]
+  weighted_cate_citizen <- sum(cate_citizen * weights_citizen) / sum(weights_citizen)
+  cate_by_citizenship[[as.character(citizen_value)]] <- weighted_cate_citizen
+}
+
+citizenshiplabels <- c(
+  "1" = "Citizen",
+  "2" = "Non-Citizen"
+)
+
+CATEcitizenship <- setNames(cate_by_citizenship, citizenshiplabels[names(cate_by_citizenship)])
+
+print(CATEcitizenship)
+
+
+#Visualization
+CATEcitizenship_df <- data.frame(
+  Citizenship = names(CATEcitizenship),
+  CATE = unlist(CATEcitizenship)
+)
+
+color_palette <- c("#A6C8E5", "#4C82A4")
+ggplot(CATEcitizenship_df, aes(x = Citizenship, y = CATE, fill = Citizenship)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  labs(
+    title = "CATE by Citizenship",
+    x = "Citizenship",
+    y = "CATE"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+```{r}
+#CATE for age
+age <- unique(data1$age)
+cate_by_age <- list()
+
+for (age_value in age) {
+  age_indices <- which(data1$age == age_value)
+  cate_age <- predict(cf)$predictions[age_indices]
+  weights_age <- data1$WTMEC8YR[age_indices]
+  weighted_cate_age <- sum(cate_age * weights_age) / sum(weights_age)
+  cate_by_age[[as.character(age_value)]] <- weighted_cate_age
+}
+
+
+#Visualization
+data1$age_group <- cut(data1$age,
+                       breaks = c(1, 19, 29, 49, 64, 80), 
+                       labels = c("1-19", "20-29", "30-49", "50-64", "65-80"),
+                       include.lowest = TRUE)
+
+# Calculate CATE for each age group (weighted average)
+CATEage_grouped_df <- data.frame(
+  AgeGroup = levels(data1$age_group),
+  CATE = sapply(levels(data1$age_group), function(age_group) {
+    age_indices <- which(data1$age_group == age_group)
+    cate_group <- predict(cf)$predictions[age_indices]
+    weights_group <- data1$WTMEC8YR[age_indices]
+    weighted_cate_group <- sum(cate_group * weights_group) / sum(weights_group)
+    return(weighted_cate_group)
+  })
+)
+
+# Custom color palette with blue tones for the 5 age groups
+color_palette <- c("#A6C8E5", "#4C82A4", "#5B9ECF", "#3A6A8D", "#1C3F57")
+
+# Plot using the defined blue tones
+ggplot(CATEage_grouped_df, aes(x = AgeGroup, y = CATE, fill = AgeGroup)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  labs(
+    title = "CATE by Age Group",
+    x = "Age Group",
+    y = "CATE"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Private
+
+### PSM
+
+```{r}
+data2 <- subset(data1, HI_or_Not == 1) # getting only people with an insurance to distinguish between private insurance and other insurances
+set.seed(124)
+library(MatchIt)
+ps.formula <- Private ~ age + gender + citizenship + race + income
+
+match.obj <- matchit(ps.formula, data = data2,
+                     method = "nearest",
+                     distance = "logit",
+                     replace = FALSE,
+                     caliper = 0.2,
+                     ratio = 1)
+
+# Add PS scores to the data
+data2$PS <- match.obj$distance
+matched.data2 <- match.data(match.obj)
+
+```
+
+```{r}
+library(survey)
+
+data2$matched <- 0 
+data2$matched[data2$seqn %in% matched.data2$seqn] <- 1  
+
+
+w.design0 <- svydesign(
+  strata = ~SDMVSTRA,       
+  id = ~SDMVPSU,             
+  weights = ~WTMEC8YR,  
+  data = data2, 
+  nest = TRUE
+)
+w.design.m <- subset(w.design0, matched == 1)
+#survey weighted logistic regression on matched data to get ATT
+out.formula <- Dental_Dummy ~ Private
+sfit <- svyglm(out.formula, family = binomial, design = w.design.m)
+
+library(jtools)
+summ(sfit, exp = TRUE, confint = TRUE)
+
+```
+
+```{r}
+coef(sfit)  
+# Converting log-odds to odds ratio
+exp(coef(sfit)["Private"]) 
+
+pred_probs_treated <- predict(sfit, newdata = subset(data2, Private == 1), type = "response")
+pred_probs_untreated <- predict(sfit, newdata = subset(data2, Private == 0), type = "response")
+att <- weighted.mean(pred_probs_treated, w = subset(data2, Private == 1)$WTMEC8YR) - 
+       weighted.mean(pred_probs_untreated, w = subset(data2, Private == 0)$WTMEC8YR)
+
+att
+```
+
+```{r}
+# Visualization
+library(ggplot2)
+
+ggplot(data2, aes(x = PS, color = as.factor(Private))) +
+  geom_density() +
+  labs(title = "Density of PS (Before Matching) Private",
+       x = "Propensity Scores",
+       y = "Density") +
+  theme_minimal()
+
+# Plot Propensity Scores after matching
+ggplot(matched.data2, aes(x = PS, color = as.factor(Private))) +
+  geom_density() +
+  labs(title = "Density of PS (After Matching) Private",
+       x = "Propensity Scores",
+       y = "Density") +
+  theme_minimal()
+
+
+```
+
+### GRF
+
+```{r}
+
+X <- model.matrix(~ race + citizenship + gender + income + age - 1, data = data2) #one-hot enocding otherwhise i get an error
+W <- W <- as.numeric(data2$Private) 
+Y <- as.numeric(data2$Dental_Dummy) - 1
+
+```
+
+```{r}
+cf <- causal_forest(X, Y, W)
+```
+
+```{r}
+treatment_effects <- predict(cf)$predictions
+# GET ATET
+treated_indices <- which(W == 1) # only on the treated
+treatment_effects_treated <- treatment_effects[treated_indices]
+weights_treated <- data2$WTMEC8YR[treated_indices]
+weighted_ATT <- sum(treatment_effects_treated * weights_treated) / sum(weights_treated)
+
+print(weighted_ATT)
+
+```
+
+```{r}
+#CATE for race
+races <- unique(data2$race)
+cate_by_race <- list()
+
+for (race_value in races) {
+  race_indices <- which(data2$race == race_value)
+  cate_race <- predict(cf)$predictions[race_indices]
+  weights_race <- data2$WTMEC8YR[race_indices]
+  weighted_cate_race <- sum(cate_race * weights_race) / sum(weights_race)
+  cate_by_race[[as.character(race_value)]] <- weighted_cate_race
+}
+
+#Adding labels
+racelabels <- c(
+  "1" = "Mexican American",
+  "2" = "Other Hispanic",
+  "3" = "White",
+  "4" = "Black",
+  "6" = "Asian",
+  "7" = "Other"
+)
+
+CATErace <- setNames(cate_by_race, racelabels[names(cate_by_race)])
+
+print(CATErace)
+
+#Visualization
+CATErace_df <- data.frame(
+  Race = names(CATErace),
+  CATE = unlist(CATErace)
+)
+
+color_palette <- c("#A6C8E5", "#4C82A4", "#5B9ECF", "#3A6A8D", "#1C3F57", "#BCC7D7")
+ggplot(CATErace_df, aes(x = Race, y = CATE, fill = Race)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  labs(
+    title = "CATE by Race",
+    x = "Race",
+    y = "CATE"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+```{r}
+#CATE for gender
+gender <- unique(data2$gender)
+cate_by_gender <- list()
+
+for (gender_value in gender) {
+  gender_indices <- which(data2$gender == gender_value)
+  cate_gender <- predict(cf)$predictions[gender_indices]
+  weights_gender <- data2$WTMEC8YR[gender_indices]
+  weighted_cate_gender <- sum(cate_gender * weights_gender) / sum(weights_gender)
+  cate_by_gender[[as.character(gender_value)]] <- weighted_cate_gender
+}
+
+#Adding labels
+genderlabels <- c(
+  "1" = "Male",
+  "2" = "Female"
+)
+
+CATEgender <- setNames(cate_by_gender, genderlabels[names(cate_by_gender)])
+
+print(CATEgender)
+
+#Visualization
+CATEgender_df <- data.frame(
+  Gender = names(CATEgender),
+  CATE = unlist(CATEgender)
+)
+
+color_palette <- c("#A6C8E5", "#4C82A4")
+ggplot(CATEgender_df, aes(x = Gender, y = CATE, fill = Gender)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  labs(
+    title = "CATE by Gender",
+    x = "Gender",
+    y = "CATE"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+```{r}
+#CATE for income
+income_groups <- unique(data2$income)
+cate_by_income <- list()
+
+for (income_value in income_groups) {
+  income_indices <- which(data2$income == income_value)
+  cate_income <- predict(cf)$predictions[income_indices]
+  weights_income <- data2$WTMEC8YR[income_indices]
+  weighted_cate_income <- sum(cate_income * weights_income) / sum(weights_income)
+  cate_by_income[[as.character(income_value)]] <- weighted_cate_income
+}
+
+# Visualization Preparation
+CATEincome_df <- data.frame(
+  Income = names(cate_by_income),
+  CATE = unlist(cate_by_income)
+)
+
+# Adding labels
+income_labels <- c(
+  "1" = "$0 to $4,999",
+  "2" = "$5,000 to $9,999",
+  "3" = "$10,000 to $14,999",
+  "4" = "$15,000 to $19,999",
+  "5" = "$20,000 to $24,999",
+  "6" = "$25,000 to $34,999",
+  "7" = "$35,000 to $44,999",
+  "8" = "$45,000 to $54,999",
+  "9" = "$55,000 to $64,999",
+  "10" = "$65,000 to $74,999",
+  "12" = "$20,000 and Over",
+  "13" = "Under $20,000",
+  "14" = "$75,000 to $99,999",
+  "15" = "$100,000 and Over"
+)
+
+#Visualization
+CATEincome_df$Income <- factor(CATEincome_df$Income, 
+                                levels = names(income_labels), 
+                                labels = income_labels[names(income_labels)])
+
+CATEincome_df$Income <- factor(CATEincome_df$Income, 
+                                levels = CATEincome_df$Income[order(CATEincome_df$CATE, decreasing = TRUE)])
+
+color_palette <- c(
+  "#A6C8E5", "#4C82A4", "#5B9ECF", "#3A6A8D", "#1C3F57", "#BCC7D7", "#C4D0D6", "#9EA6B7", "#7C8594", "#4A5B71", "#2E3F52", "#1C2839", "#7E92A0", "#B0C4D8", "#6D7D8C" 
+)
+
+
+ggplot(CATEincome_df, aes(x = Income, y = CATE, fill = Income)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  labs(
+    title = "CATE by Income",
+    x = "Income",
+    y = "CATE"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"  
+  )
+
+```
+
+```{r}
+#CATE for citizenship
+citizenship <- unique(data2$citizenship)
+cate_by_citizenship <- list()
+
+for (citizen_value in citizenship) {
+  citizen_indices <- which(data2$citizenship == citizen_value)
+  cate_citizen <- predict(cf)$predictions[citizen_indices]
+  weights_citizen <- data2$WTMEC8YR[citizen_indices]
+  weighted_cate_citizen <- sum(cate_citizen * weights_citizen) / sum(weights_citizen)
+  cate_by_citizenship[[as.character(citizen_value)]] <- weighted_cate_citizen
+}
+
+citizenshiplabels <- c(
+  "1" = "Citizen",
+  "2" = "Non-Citizen"
+)
+
+CATEcitizenship <- setNames(cate_by_citizenship, citizenshiplabels[names(cate_by_citizenship)])
+
+print(CATEcitizenship)
+
+
+#Visualization
+CATEcitizenship_df <- data.frame(
+  Citizenship = names(CATEcitizenship),
+  CATE = unlist(CATEcitizenship)
+)
+
+color_palette <- c("#A6C8E5", "#4C82A4")
+ggplot(CATEcitizenship_df, aes(x = Citizenship, y = CATE, fill = Citizenship)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  labs(
+    title = "CATE by Citizenship",
+    x = "Citizenship",
+    y = "CATE"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+```{r}
+#CATE for age
+age <- unique(data2$age)
+cate_by_age <- list()
+
+for (age_value in age) {
+  age_indices <- which(data2$age == age_value)
+  cate_age <- predict(cf)$predictions[age_indices]
+  weights_age <- data2$WTMEC8YR[age_indices]
+  weighted_cate_age <- sum(cate_age * weights_age) / sum(weights_age)
+  cate_by_age[[as.character(age_value)]] <- weighted_cate_age
+}
+
+
+#Visualization
+data2$age_group <- cut(data2$age,
+                       breaks = c(1, 19, 29, 49, 64, 80), 
+                       labels = c("1-19", "20-29", "30-49", "50-64", "65-80"),
+                       include.lowest = TRUE)
+
+# Calculate CATE for each age group (weighted average)
+CATEage_grouped_df <- data.frame(
+  AgeGroup = levels(data2$age_group),
+  CATE = sapply(levels(data2$age_group), function(age_group) {
+    age_indices <- which(data2$age_group == age_group)
+    cate_group <- predict(cf)$predictions[age_indices]
+    weights_group <- data2$WTMEC8YR[age_indices]
+    weighted_cate_group <- sum(cate_group * weights_group) / sum(weights_group)
+    return(weighted_cate_group)
+  })
+)
+
+# Custom color palette with blue tones for the 5 age groups
+color_palette <- c("#A6C8E5", "#4C82A4", "#5B9ECF", "#3A6A8D", "#1C3F57")
+
+# Plot using the defined blue tones
+ggplot(CATEage_grouped_df, aes(x = AgeGroup, y = CATE, fill = AgeGroup)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  labs(
+    title = "CATE by Age Group",
+    x = "Age Group",
+    y = "CATE"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+## Medicare
+
+### PSM
+
+```{r}
+data3 <- subset(data3, HI_or_Not == 1 & age >= 50) # getting only people with an insurance and that are older than 50 to distinguish between Medicare and other insurances
+set.seed(123)
+library(MatchIt)
+ps.formula <- Medicare ~ age + gender + citizenship + race + income
+
+match.obj <- matchit(ps.formula, data = data3,
+                     method = "nearest",
+                     distance = "logit",
+                     replace = FALSE,
+                     caliper = 0.2,
+                     ratio = 1)
+
+# Add PS scores to the data
+data3$PS <- match.obj$distance
+matched.data3 <- match.data(match.obj)
+
+```
+
+```{r}
+library(survey)
+
+data3$matched <- 0 
+data3$matched[data3$seqn %in% matched.data3$seqn] <- 1  
+
+
+w.design0 <- svydesign(
+  strata = ~SDMVSTRA,       
+  id = ~SDMVPSU,             
+  weights = ~WTMEC8YR,  
+  data = data3, 
+  nest = TRUE
+)
+w.design.m <- subset(w.design0, matched == 1)
+#survey weighted logistic regression on matched data to get ATT
+out.formula <- Dental_Dummy ~ Medicare
+sfit <- svyglm(out.formula, family = binomial, design = w.design.m)
+
+library(jtools)
+summ(sfit, exp = TRUE, confint = TRUE)
+
+```
+
+```{r}
+coef(sfit)  
+# Converting log-odds to odds ratio
+exp(coef(sfit)["Medicare"]) 
+
+pred_probs_treated <- predict(sfit, newdata = subset(data3, Medicare == 1), type = "response")
+pred_probs_untreated <- predict(sfit, newdata = subset(data3, Medicare == 0), type = "response")
+att <- weighted.mean(pred_probs_treated, w = subset(data3, Medicare == 1)$WTMEC8YR) - 
+       weighted.mean(pred_probs_untreated, w = subset(data3, Medicare == 0)$WTMEC8YR)
+
+att
+
+```
+
+```{r}
+# Visualization
+library(ggplot2)
+
+ggplot(data3, aes(x = PS, color = as.factor(Medicare))) +
+  geom_density() +
+  labs(title = "Density of PS (Before Matching) Medicare",
+       x = "Propensity Scores",
+       y = "Density") +
+  theme_minimal()
+
+# Plot Propensity Scores after matching
+ggplot(matched.data1, aes(x = PS, color = as.factor(Medicare))) +
+  geom_density() +
+  labs(title = "Density of PS (After Matching) Medicare",
+       x = "Propensity Scores",
+       y = "Density") +
+  theme_minimal()
+
+
+```
+
+### GRF
+
+```{r}
+X <- model.matrix(~ race + citizenship + gender + income + age - 1, data = data3) #one-hot enocding otherwhise i get an error
+W <- W <- as.numeric(data3$Medicare) 
+Y <- as.numeric(data3$Dental_Dummy) - 1
+
+```
+
+```{r}
+cf <- causal_forest(X, Y, W)
+```
+
+```{r}
+treatment_effects <- predict(cf)$predictions
+# GET ATET
+treated_indices <- which(W == 1) # only on the treated
+treatment_effects_treated <- treatment_effects[treated_indices]
+weights_treated <- data3$WTMEC8YR[treated_indices]
+weighted_ATT <- sum(treatment_effects_treated * weights_treated) / sum(weights_treated)
+
+print(weighted_ATT)
+
+```
+
+```{r}
+#CATE for race
+races <- unique(data3$race)
+cate_by_race <- list()
+
+for (race_value in races) {
+  race_indices <- which(data3$race == race_value)
+  cate_race <- predict(cf)$predictions[race_indices]
+  weights_race <- data3$WTMEC8YR[race_indices]
+  weighted_cate_race <- sum(cate_race * weights_race) / sum(weights_race)
+  cate_by_race[[as.character(race_value)]] <- weighted_cate_race
+}
+
+#Adding labels
+racelabels <- c(
+  "1" = "Mexican American",
+  "2" = "Other Hispanic",
+  "3" = "White",
+  "4" = "Black",
+  "6" = "Asian",
+  "7" = "Other"
+)
+
+CATErace <- setNames(cate_by_race, racelabels[names(cate_by_race)])
+
+print(CATErace)
+
+#Visualization
+CATErace_df <- data.frame(
+  Race = names(CATErace),
+  CATE = unlist(CATErace)
+)
+
+color_palette <- c("#A6C8E5", "#4C82A4", "#5B9ECF", "#3A6A8D", "#1C3F57", "#BCC7D7")
+ggplot(CATErace_df, aes(x = Race, y = CATE, fill = Race)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  labs(
+    title = "CATE by Race",
+    x = "Race",
+    y = "CATE"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+```{r}
+#CATE for gender
+gender <- unique(data3$gender)
+cate_by_gender <- list()
+
+for (gender_value in gender) {
+  gender_indices <- which(data3$gender == gender_value)
+  cate_gender <- predict(cf)$predictions[gender_indices]
+  weights_gender <- data3$WTMEC8YR[gender_indices]
+  weighted_cate_gender <- sum(cate_gender * weights_gender) / sum(weights_gender)
+  cate_by_gender[[as.character(gender_value)]] <- weighted_cate_gender
+}
+
+#Adding labels
+genderlabels <- c(
+  "1" = "Male",
+  "2" = "Female"
+)
+
+CATEgender <- setNames(cate_by_gender, genderlabels[names(cate_by_gender)])
+
+print(CATEgender)
+
+#Visualization
+CATEgender_df <- data.frame(
+  Gender = names(CATEgender),
+  CATE = unlist(CATEgender)
+)
+
+color_palette <- c("#A6C8E5", "#4C82A4")
+ggplot(CATEgender_df, aes(x = Gender, y = CATE, fill = Gender)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  labs(
+    title = "CATE by Gender",
+    x = "Gender",
+    y = "CATE"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+```{r}
+#CATE for income
+income_groups <- unique(data3$income)
+cate_by_income <- list()
+
+for (income_value in income_groups) {
+  income_indices <- which(data3$income == income_value)
+  cate_income <- predict(cf)$predictions[income_indices]
+  weights_income <- data3$WTMEC8YR[income_indices]
+  weighted_cate_income <- sum(cate_income * weights_income) / sum(weights_income)
+  cate_by_income[[as.character(income_value)]] <- weighted_cate_income
+}
+
+# Visualization Preparation
+CATEincome_df <- data.frame(
+  Income = names(cate_by_income),
+  CATE = unlist(cate_by_income)
+)
+
+# Adding labels
+income_labels <- c(
+  "1" = "$0 to $4,999",
+  "2" = "$5,000 to $9,999",
+  "3" = "$10,000 to $14,999",
+  "4" = "$15,000 to $19,999",
+  "5" = "$20,000 to $24,999",
+  "6" = "$25,000 to $34,999",
+  "7" = "$35,000 to $44,999",
+  "8" = "$45,000 to $54,999",
+  "9" = "$55,000 to $64,999",
+  "10" = "$65,000 to $74,999",
+  "12" = "$20,000 and Over",
+  "13" = "Under $20,000",
+  "14" = "$75,000 to $99,999",
+  "15" = "$100,000 and Over"
+)
+
+#Visualization
+CATEincome_df$Income <- factor(CATEincome_df$Income, 
+                                levels = names(income_labels), 
+                                labels = income_labels[names(income_labels)])
+
+CATEincome_df$Income <- factor(CATEincome_df$Income, 
+                                levels = CATEincome_df$Income[order(CATEincome_df$CATE, decreasing = TRUE)])
+
+color_palette <- c(
+  "#A6C8E5", "#4C82A4", "#5B9ECF", "#3A6A8D", "#1C3F57", "#BCC7D7", "#C4D0D6", "#9EA6B7", "#7C8594", "#4A5B71", "#2E3F52", "#1C2839", "#7E92A0", "#B0C4D8", "#6D7D8C" 
+)
+
+
+ggplot(CATEincome_df, aes(x = Income, y = CATE, fill = Income)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  labs(
+    title = "CATE by Income",
+    x = "Income",
+    y = "CATE"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"  
+  )
+
+```
+
+```{r}
+#CATE for citizenship
+citizenship <- unique(data3$citizenship)
+cate_by_citizenship <- list()
+
+for (citizen_value in citizenship) {
+  citizen_indices <- which(data3$citizenship == citizen_value)
+  cate_citizen <- predict(cf)$predictions[citizen_indices]
+  weights_citizen <- data3$WTMEC8YR[citizen_indices]
+  weighted_cate_citizen <- sum(cate_citizen * weights_citizen) / sum(weights_citizen)
+  cate_by_citizenship[[as.character(citizen_value)]] <- weighted_cate_citizen
+}
+
+citizenshiplabels <- c(
+  "1" = "Citizen",
+  "2" = "Non-Citizen"
+)
+
+CATEcitizenship <- setNames(cate_by_citizenship, citizenshiplabels[names(cate_by_citizenship)])
+
+print(CATEcitizenship)
+
+
+#Visualization
+CATEcitizenship_df <- data.frame(
+  Citizenship = names(CATEcitizenship),
+  CATE = unlist(CATEcitizenship)
+)
+
+color_palette <- c("#A6C8E5", "#4C82A4")
+ggplot(CATEcitizenship_df, aes(x = Citizenship, y = CATE, fill = Citizenship)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  labs(
+    title = "CATE by Citizenship",
+    x = "Citizenship",
+    y = "CATE"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+```{r}
+#CATE for age
+age <- unique(data3$age)
+cate_by_age <- list()
+
+for (age_value in age) {
+  age_indices <- which(data3$age == age_value)
+  cate_age <- predict(cf)$predictions[age_indices]
+  weights_age <- data3$WTMEC8YR[age_indices]
+  weighted_cate_age <- sum(cate_age * weights_age) / sum(weights_age)
+  cate_by_age[[as.character(age_value)]] <- weighted_cate_age
+}
+
+
+#Visualization
+data3$age_group <- cut(data3$age,
+                       breaks = c(50, 64, 80), 
+                       labels = c("50-64", "65-80"),
+                       include.lowest = TRUE)
+
+# Calculate CATE for each age group (weighted average)
+CATEage_grouped_df <- data.frame(
+  AgeGroup = levels(data3$age_group),
+  CATE = sapply(levels(data3$age_group), function(age_group) {
+    age_indices <- which(data3$age_group == age_group)
+    cate_group <- predict(cf)$predictions[age_indices]
+    weights_group <- data3$WTMEC8YR[age_indices]
+    weighted_cate_group <- sum(cate_group * weights_group) / sum(weights_group)
+    return(weighted_cate_group)
+  })
+)
+
+# Plot
+color_palette <- c("#4C82A4", "#1C3F57")
+ggplot(CATEage_grouped_df, aes(x = AgeGroup, y = CATE, fill = AgeGroup)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  labs(
+    title = "CATE by Age Group (50+)",
+    x = "Age Group",
+    y = "CATE"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Medicaid
+
+### PSM
+
+```{r}
+data4 <- subset(data4, HI_or_Not == 1) # getting only people with an insurance to distinguish between Medicaid insurance and other insurances
+set.seed(123)
+library(MatchIt)
+ps.formula <- Medicaid ~ age + gender + citizenship + race + income
+
+match.obj <- matchit(ps.formula, data = data4,
+                     method = "nearest",
+                     distance = "logit",
+                     replace = FALSE,
+                     caliper = 0.2,
+                     ratio = 1)
+
+# Add PS scores to the data
+data4$PS <- match.obj$distance
+matched.data4 <- match.data(match.obj)
+
+```
+
+```{r}
+library(survey)
+
+data4$matched <- 0 
+data4$matched[data4$seqn %in% matched.data4$seqn] <- 1  
+
+
+w.design0 <- svydesign(
+  strata = ~SDMVSTRA,       
+  id = ~SDMVPSU,             
+  weights = ~WTMEC8YR,  
+  data = data4, 
+  nest = TRUE
+)
+w.design.m <- subset(w.design0, matched == 1)
+#survey weighted logistic regression on matched data to get ATT
+out.formula <- Dental_Dummy ~ Medicare
+sfit <- svyglm(out.formula, family = binomial, design = w.design.m)
+
+library(jtools)
+summ(sfit, exp = TRUE, confint = TRUE)
+
+```
+
+```{r}
+coef(sfit)  
+# Converting log-odds to odds ratio
+exp(coef(sfit)["Medicaid"]) 
+
+pred_probs_treated <- predict(sfit, newdata = subset(data4, Medicaid == 1), type = "response")
+pred_probs_untreated <- predict(sfit, newdata = subset(data4, Medicaid == 0), type = "response")
+att <- weighted.mean(pred_probs_treated, w = subset(data4, Medicaid == 1)$WTMEC8YR) - 
+       weighted.mean(pred_probs_untreated, w = subset(data4, Medicaid == 0)$WTMEC8YR)
+
+att
+
+```
+
+```{r}
+# Visualization
+library(ggplot2)
+
+ggplot(data4, aes(x = PS, color = as.factor(Medicaid))) +
+  geom_density() +
+  labs(title = "Density of PS (Before Matching) Medicaid",
+       x = "Propensity Scores",
+       y = "Density") +
+  theme_minimal()
+
+# Plot Propensity Scores after matching
+ggplot(matched.data4, aes(x = PS, color = as.factor(Medicaid))) +
+  geom_density() +
+  labs(title = "Density of PS (After Matching) Medicaid",
+       x = "Propensity Scores",
+       y = "Density") +
+  theme_minimal()
+
+```
+
+### GRF
+
+```{r}
+X <- model.matrix(~ race + citizenship + gender + income + age - 1, data = data4) #one-hot enocding otherwhise i get an error
+W <- W <- as.numeric(data4$Medicaid) 
+Y <- as.numeric(data4$Dental_Dummy) - 1
+
+```
+
+```{r}
+cf <- causal_forest(X, Y, W)
+```
+
+```{r}
+treatment_effects <- predict(cf)$predictions
+# GET ATET
+treated_indices <- which(W == 1) # only on the treated
+treatment_effects_treated <- treatment_effects[treated_indices]
+weights_treated <- data4$WTMEC8YR[treated_indices]
+weighted_ATT <- sum(treatment_effects_treated * weights_treated) / sum(weights_treated)
+
+print(weighted_ATT)
+
+```
+
+```{r}
+#CATE for race
+races <- unique(data4$race)
+cate_by_race <- list()
+
+for (race_value in races) {
+  race_indices <- which(data4$race == race_value)
+  cate_race <- predict(cf)$predictions[race_indices]
+  weights_race <- data4$WTMEC8YR[race_indices]
+  weighted_cate_race <- sum(cate_race * weights_race) / sum(weights_race)
+  cate_by_race[[as.character(race_value)]] <- weighted_cate_race
+}
+
+#Adding labels
+racelabels <- c(
+  "1" = "Mexican American",
+  "2" = "Other Hispanic",
+  "3" = "White",
+  "4" = "Black",
+  "6" = "Asian",
+  "7" = "Other"
+)
+
+CATErace <- setNames(cate_by_race, racelabels[names(cate_by_race)])
+
+print(CATErace)
+
+#Visualization
+CATErace_df <- data.frame(
+  Race = names(CATErace),
+  CATE = unlist(CATErace)
+)
+
+color_palette <- c("#A6C8E5", "#4C82A4", "#5B9ECF", "#3A6A8D", "#1C3F57", "#BCC7D7")
+ggplot(CATErace_df, aes(x = Race, y = CATE, fill = Race)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  labs(
+    title = "CATE by Race",
+    x = "Race",
+    y = "CATE"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+```{r}
+#CATE for gender
+gender <- unique(data4$gender)
+cate_by_gender <- list()
+
+for (gender_value in gender) {
+  gender_indices <- which(data4$gender == gender_value)
+  cate_gender <- predict(cf)$predictions[gender_indices]
+  weights_gender <- data4$WTMEC8YR[gender_indices]
+  weighted_cate_gender <- sum(cate_gender * weights_gender) / sum(weights_gender)
+  cate_by_gender[[as.character(gender_value)]] <- weighted_cate_gender
+}
+
+#Adding labels
+genderlabels <- c(
+  "1" = "Male",
+  "2" = "Female"
+)
+
+CATEgender <- setNames(cate_by_gender, genderlabels[names(cate_by_gender)])
+
+print(CATEgender)
+
+#Visualization
+CATEgender_df <- data.frame(
+  Gender = names(CATEgender),
+  CATE = unlist(CATEgender)
+)
+
+color_palette <- c("#A6C8E5", "#4C82A4")
+ggplot(CATEgender_df, aes(x = Gender, y = CATE, fill = Gender)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  labs(
+    title = "CATE by Gender",
+    x = "Gender",
+    y = "CATE"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+```{r}
+#CATE for income
+income_groups <- unique(data4$income)
+cate_by_income <- list()
+
+for (income_value in income_groups) {
+  income_indices <- which(data4$income == income_value)
+  cate_income <- predict(cf)$predictions[income_indices]
+  weights_income <- data4$WTMEC8YR[income_indices]
+  weighted_cate_income <- sum(cate_income * weights_income) / sum(weights_income)
+  cate_by_income[[as.character(income_value)]] <- weighted_cate_income
+}
+
+# Visualization Preparation
+CATEincome_df <- data.frame(
+  Income = names(cate_by_income),
+  CATE = unlist(cate_by_income)
+)
+
+# Adding labels
+income_labels <- c(
+  "1" = "$0 to $4,999",
+  "2" = "$5,000 to $9,999",
+  "3" = "$10,000 to $14,999",
+  "4" = "$15,000 to $19,999",
+  "5" = "$20,000 to $24,999",
+  "6" = "$25,000 to $34,999",
+  "7" = "$35,000 to $44,999",
+  "8" = "$45,000 to $54,999",
+  "9" = "$55,000 to $64,999",
+  "10" = "$65,000 to $74,999",
+  "12" = "$20,000 and Over",
+  "13" = "Under $20,000",
+  "14" = "$75,000 to $99,999",
+  "15" = "$100,000 and Over"
+)
+
+#Visualization
+CATEincome_df$Income <- factor(CATEincome_df$Income, 
+                                levels = names(income_labels), 
+                                labels = income_labels[names(income_labels)])
+
+CATEincome_df$Income <- factor(CATEincome_df$Income, 
+                                levels = CATEincome_df$Income[order(CATEincome_df$CATE, decreasing = TRUE)])
+
+color_palette <- c(
+  "#A6C8E5", "#4C82A4", "#5B9ECF", "#3A6A8D", "#1C3F57", "#BCC7D7", "#C4D0D6", "#9EA6B7", "#7C8594", "#4A5B71", "#2E3F52", "#1C2839", "#7E92A0", "#B0C4D8", "#6D7D8C" 
+)
+
+
+ggplot(CATEincome_df, aes(x = Income, y = CATE, fill = Income)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  labs(
+    title = "CATE by Income",
+    x = "Income",
+    y = "CATE"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"  
+  )
+
+```
+
+```{r}
+#CATE for citizenship
+citizenship <- unique(data4$citizenship)
+cate_by_citizenship <- list()
+
+for (citizen_value in citizenship) {
+  citizen_indices <- which(data4$citizenship == citizen_value)
+  cate_citizen <- predict(cf)$predictions[citizen_indices]
+  weights_citizen <- data4$WTMEC8YR[citizen_indices]
+  weighted_cate_citizen <- sum(cate_citizen * weights_citizen) / sum(weights_citizen)
+  cate_by_citizenship[[as.character(citizen_value)]] <- weighted_cate_citizen
+}
+
+citizenshiplabels <- c(
+  "1" = "Citizen",
+  "2" = "Non-Citizen"
+)
+
+CATEcitizenship <- setNames(cate_by_citizenship, citizenshiplabels[names(cate_by_citizenship)])
+
+print(CATEcitizenship)
+
+
+#Visualization
+CATEcitizenship_df <- data.frame(
+  Citizenship = names(CATEcitizenship),
+  CATE = unlist(CATEcitizenship)
+)
+
+color_palette <- c("#A6C8E5", "#4C82A4")
+ggplot(CATEcitizenship_df, aes(x = Citizenship, y = CATE, fill = Citizenship)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  labs(
+    title = "CATE by Citizenship",
+    x = "Citizenship",
+    y = "CATE"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+```{r}
+#CATE for age
+age <- unique(data4$age)
+cate_by_age <- list()
+
+for (age_value in age) {
+  age_indices <- which(data4$age == age_value)
+  cate_age <- predict(cf)$predictions[age_indices]
+  weights_age <- data4$WTMEC8YR[age_indices]
+  weighted_cate_age <- sum(cate_age * weights_age) / sum(weights_age)
+  cate_by_age[[as.character(age_value)]] <- weighted_cate_age
+}
+
+
+#Visualization
+data4$age_group <- cut(data4$age,
+                       breaks = c(1, 19, 29, 49, 64, 80), 
+                       labels = c("1-19", "20-29", "30-49", "50-64", "65-80"),
+                       include.lowest = TRUE)
+
+# Calculate CATE for each age group (weighted average)
+CATEage_grouped_df <- data.frame(
+  AgeGroup = levels(data4$age_group),
+  CATE = sapply(levels(data4$age_group), function(age_group) {
+    age_indices <- which(data4$age_group == age_group)
+    cate_group <- predict(cf)$predictions[age_indices]
+    weights_group <- data4$WTMEC8YR[age_indices]
+    weighted_cate_group <- sum(cate_group * weights_group) / sum(weights_group)
+    return(weighted_cate_group)
+  })
+)
+
+# Custom color palette with blue tones for the 5 age groups
+color_palette <- c("#A6C8E5", "#4C82A4", "#5B9ECF", "#3A6A8D", "#1C3F57")
+
+# Plot using the defined blue tones
+ggplot(CATEage_grouped_df, aes(x = AgeGroup, y = CATE, fill = AgeGroup)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  labs(
+    title = "CATE by Age Group",
+    x = "Age Group",
+    y = "CATE"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
