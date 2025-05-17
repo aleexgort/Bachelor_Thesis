@@ -5,7 +5,9 @@ data_raw: contains all the datasets directly downloaded from the NHANES website,
 
 data_cleaning: contains the data cleaning notebook (in python), and the finished clean dataset which was used for the analysis.
 
-data_analysis: containes the RMD notebook with the whole analysis.
+docs: contains the html version of the notebook with the whole analysis - code and output.
 
-ChatGPT_prompts: contains prompts and responses.
+data_analysis: containes the RMD notebook with the whole analysis - code only.
+
+ChatGPT_prompts: contains prompts and responses document.
 
