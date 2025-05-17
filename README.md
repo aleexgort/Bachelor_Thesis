@@ -9,5 +9,5 @@ docs: contains the html version of the notebook with the whole analysis - code a
 
 data_analysis: containes the RMD notebook with the whole analysis - code only.
 
-ChatGPT_prompts: contains prompts and responses document.
+prompts: contains chatgpt prompts and responses document.
 
